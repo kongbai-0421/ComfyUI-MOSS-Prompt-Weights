@@ -207,6 +207,7 @@ def extract_text_masks(negpip_mask: torch.Tensor, v: torch.Tensor):
 
 
 def _wrap_attn(tensor: torch.Tensor, use_container: bool):
+    """Create a fresh single-use AttentionTensorContainer for each optimized_attention call."""
     if use_container and AttentionTensorContainer is not None:
         return AttentionTensorContainer(tensor)
     return tensor
@@ -293,20 +294,20 @@ def run_v_scaling_native_block(block, args, kwargs, negpip_mask: torch.Tensor) -
         if hasattr(block, "comfy_attention") and attn_fn is optimized_attention:
             attn_kwargs["preferred_attention"] = block.comfy_attention
 
-        # 1. Text Query attends to unscaled text values
+        # 1. Text Query attends to unscaled text values (fresh containers for q, k, v)
         q_txt = _wrap_attn(q[:, imglen:], use_container)
-        k_cont = _wrap_attn(k, use_container)
-        v_cont = _wrap_attn(v, use_container)
+        k_txt = _wrap_attn(k, use_container)
+        v_txt = _wrap_attn(v, use_container)
         mask_txt = mask[:, :, :, imglen:] if mask is not None else None
-        out_txt = attn_fn(q_txt, k_cont, v_cont, heads, mask=mask_txt, **attn_kwargs)
+        out_txt = attn_fn(q_txt, k_txt, v_txt, heads, mask=mask_txt, **attn_kwargs)
 
-        # 2. Image Query attends to scaled text values (Query Separation)
-        v_scaled = v.clone()
-        v_scaled[:, imglen:imglen + txtlen] = v_scaled[:, imglen:imglen + txtlen] * image_mask
+        # 2. Image Query attends to scaled text values (fresh containers for q, k, v)
+        v[:, imglen:imglen + txtlen] = v[:, imglen:imglen + txtlen] * (image_mask * sign_mask)
         q_img = _wrap_attn(q[:, :imglen], use_container)
-        v_scaled_cont = _wrap_attn(v_scaled, use_container)
+        k_img = _wrap_attn(k, use_container)
+        v_img = _wrap_attn(v, use_container)
         mask_img = mask[:, :, :, :imglen] if mask is not None else None
-        out_img = attn_fn(q_img, k_cont, v_scaled_cont, heads, mask=mask_img, **attn_kwargs)
+        out_img = attn_fn(q_img, k_img, v_img, heads, mask=mask_img, **attn_kwargs)
 
         # 3. Concatenate along sequence dimension
         out = torch.cat((out_img, out_txt), dim=1)
@@ -391,14 +392,14 @@ def run_v_scaling_extension_block(block, args, kwargs, negpip_mask: torch.Tensor
         else:
             out = optimized_attention(q, k, v, heads, skip_reshape=True, transformer_options=options)
     else:
-        v_scaled = v.clone()
-        v_scaled[:, :, imglen:imglen + txtlen] = v_scaled[:, :, imglen:imglen + txtlen] * image_mask.unsqueeze(1)
         if has_kernels:
             out_txt = transformer.kernels.attention(q[:, :, imglen:], k, v, transformer_options=options)
-            out_img = transformer.kernels.attention(q[:, :, :imglen], k, v_scaled, transformer_options=options)
+            v[:, :, imglen:imglen + txtlen] = v[:, :, imglen:imglen + txtlen] * (image_mask * sign_mask).unsqueeze(1)
+            out_img = transformer.kernels.attention(q[:, :, :imglen], k, v, transformer_options=options)
         else:
             out_txt = optimized_attention(q[:, :, imglen:], k, v, heads, skip_reshape=True, transformer_options=options)
-            out_img = optimized_attention(q[:, :, :imglen], k, v_scaled, heads, skip_reshape=True, transformer_options=options)
+            v[:, :, imglen:imglen + txtlen] = v[:, :, imglen:imglen + txtlen] * (image_mask * sign_mask).unsqueeze(1)
+            out_img = optimized_attention(q[:, :, :imglen], k, v, heads, skip_reshape=True, transformer_options=options)
         out = torch.cat((out_img, out_txt), dim=1)
 
     out = block.proj["o"](out.to(dtype))
@@ -421,8 +422,14 @@ def patch_diffusion_model_for_v_scaling(model_patcher):
     model_clone = model_patcher.clone()
 
     # 1. Wrap model.extra_conds so c_negpip_mask is forwarded to model_conds
-    orig_extra_conds = getattr(model_clone.model, "extra_conds", None)
-    if orig_extra_conds is not None and not getattr(orig_extra_conds, "_moss_wrapped", False):
+    base_model = model_clone.model
+    orig_extra_conds = getattr(base_model, "_moss_orig_extra_conds", None)
+    if orig_extra_conds is None:
+        orig_extra_conds = getattr(base_model, "extra_conds", None)
+        if orig_extra_conds is not None:
+            base_model._moss_orig_extra_conds = orig_extra_conds
+
+    if orig_extra_conds is not None:
         import comfy.conds
 
         @wraps(orig_extra_conds)
@@ -438,7 +445,7 @@ def patch_diffusion_model_for_v_scaling(model_patcher):
         if hasattr(model_clone, "add_object_patch"):
             model_clone.add_object_patch("extra_conds", moss_extra_conds)
         else:
-            model_clone.model.extra_conds = moss_extra_conds
+            base_model.extra_conds = moss_extra_conds
 
     # 2. Add unet_function_wrapper to guarantee negpip_mask enters transformer_options & ContextVar
     orig_wrapper = model_clone.model_options.get("model_function_wrapper", None)
@@ -470,13 +477,13 @@ def patch_diffusion_model_for_v_scaling(model_patcher):
     model_clone.set_model_unet_function_wrapper(moss_unet_wrapper)
 
     # 3. Hook each layer's forward via add_object_patch to respect ComfyUI's ModelPatcher lifecycle
-    dit = getattr(model_clone.model, "diffusion_model", None)
+    dit = getattr(base_model, "diffusion_model", None)
     dit_layers = getattr(dit, "layers", ())
     for idx, block in enumerate(dit_layers):
-        if getattr(block.forward, "_moss_patched", False):
-            continue
-
-        orig_forward = block.forward
+        orig_forward = getattr(block, "_moss_orig_forward", None)
+        if orig_forward is None:
+            orig_forward = block.forward
+            block._moss_orig_forward = orig_forward
 
         def make_moss_forward(b, orig_fn):
             mod_name = getattr(_module_of(b), "__name__", "")
