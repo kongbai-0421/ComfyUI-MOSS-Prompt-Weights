@@ -1,0 +1,17 @@
+[project]
+name = "comfyui-moss-prompt-weights"
+version = "1.0.0"
+description = "MOSS-Image Prompt Weighting via DiT Attention V-Scaling for ComfyUI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+]
+
+[project.urls]
+Repository = "https://github.com/kongbai-0421/ComfyUI-MOSS-Prompt-Weights"
+
+[tool.comfy]
+PublisherId = "kongbai-0421"
+DisplayName = "ComfyUI MOSS Prompt Weights"
+Icon = "🎯"
