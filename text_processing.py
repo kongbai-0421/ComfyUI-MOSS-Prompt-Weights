@@ -33,7 +33,7 @@ def parse_prompt_attention(text: str, emphasis: str = "Original") -> List[Tuple[
     Supports (tag:1.2), (tag), [tag], [tag:0.8], (ugly:-1.0).
     """
     if emphasis == "Ignore":
-        return [[text, 1.0]]
+        return [(text, 1.0)]
 
     res = []
     round_brackets = []
@@ -75,7 +75,7 @@ def parse_prompt_attention(text: str, emphasis: str = "Original") -> List[Tuple[
             parts = re.split(re_break, token)
             for i, part in enumerate(parts):
                 if i > 0:
-                    res.append(["BREAK", -1.0])
+                    res.append([" BREAK ", 1.0])
                 res.append([part, 1.0])
 
     for pos in round_brackets:

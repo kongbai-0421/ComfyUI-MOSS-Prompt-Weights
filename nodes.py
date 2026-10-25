@@ -6,6 +6,7 @@ import torch.nn.functional as F
 try:
     from .v_scaling import (
         compute_weight_masks,
+        get_chat_template,
         get_hf_tokenizer,
         patch_diffusion_model_for_v_scaling,
         tokenize_moss_prompt,
@@ -13,6 +14,7 @@ try:
 except ImportError:
     from v_scaling import (
         compute_weight_masks,
+        get_chat_template,
         get_hf_tokenizer,
         patch_diffusion_model_for_v_scaling,
         tokenize_moss_prompt,
@@ -21,7 +23,7 @@ except ImportError:
 
 class MOSSTextEncode:
     """Encode MOSS-Image text prompts with DiT Attention V-Scaling weights.
-    
+
     Resolves Qwen3.5 and MOSS DiT RMSNorm neutralization of prompt weights.
     Applies weight_multiplier exclusively to tokens with weights > 1.0 (actual weight = weight * multiplier).
     Preserves Danbooru escaped brackets, reduction weights, and negative suppressions at original value.
@@ -32,24 +34,33 @@ class MOSSTextEncode:
         return {
             "required": {
                 "clip": ("CLIP",),
-                "text": ("STRING", {
-                    "multiline": True,
-                    "dynamicPrompts": True,
-                    "default": "",
-                    "tooltip": "Prompt text. Supports (tag:1.2), [tag:0.8], (ugly:-1.0), and Danbooru escaped brackets saori \\(blue archive\\)."
-                }),
-                "weight_multiplier": ("FLOAT", {
-                    "default": 5.0,
-                    "min": 1.0,
-                    "max": 50.0,
-                    "step": 0.5,
-                    "display": "number",
-                    "tooltip": "Multiplier applied only when token weight > 1.0. Defaults to 5.0 (e.g. 1.2 -> 6.0). Weights <= 1.0 stay unchanged."
-                }),
-                "emphasis_mode": (["Original", "Ignore"], {
-                    "default": "Original",
-                    "tooltip": "'Original' parses emphasis brackets. 'Ignore' treats all brackets as literal text."
-                }),
+                "text": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "dynamicPrompts": True,
+                        "default": "",
+                        "tooltip": "Prompt text. Supports (tag:1.2), [tag:0.8], (ugly:-1.0), and Danbooru escaped brackets saori \\(blue archive\\).",
+                    },
+                ),
+                "weight_multiplier": (
+                    "FLOAT",
+                    {
+                        "default": 5.0,
+                        "min": 1.0,
+                        "max": 50.0,
+                        "step": 0.5,
+                        "display": "number",
+                        "tooltip": "Multiplier applied only when token weight > 1.0. Defaults to 5.0 (e.g. 1.2 -> 6.0). Weights <= 1.0 stay unchanged.",
+                    },
+                ),
+                "emphasis_mode": (
+                    ["Original", "Ignore"],
+                    {
+                        "default": "Original",
+                        "tooltip": "'Original' parses emphasis brackets. 'Ignore' treats all brackets as literal text.",
+                    },
+                ),
             }
         }
 
@@ -60,20 +71,28 @@ class MOSSTextEncode:
 
     def encode(self, clip, text, weight_multiplier=5.0, emphasis_mode="Original"):
         hf_tokenizer = get_hf_tokenizer(clip)
-        tokens, multipliers = tokenize_moss_prompt(hf_tokenizer, text, emphasis_mode)
+        template = get_chat_template(clip)
+        tokens, multipliers = tokenize_moss_prompt(hf_tokenizer, text, emphasis_mode, template=template)
         encoder_scales, mask = compute_weight_masks(multipliers, weight_multiplier)
 
-        # Detect clip tokenizer name (e.g. 'qwen35_9b')
-        clip_name = getattr(clip.tokenizer, "name", None)
-        if not clip_name:
-            sample_tokens = clip.tokenize("")
-            clip_name = list(sample_tokens.keys())[0] if sample_tokens else "qwen35_9b"
+        weighted_pairs = [[(t_id, w) for t_id, w in zip(tokens, encoder_scales)]]
 
-        token_dict = {clip_name: [[(t_id, w) for t_id, w in zip(tokens, encoder_scales)]]}
+        # Detect token structure expected by clip.encode_from_tokens
+        sample_tokens = clip.tokenize("")
+        if isinstance(sample_tokens, dict):
+            clip_name = next(iter(sample_tokens.keys()), "qwen35_9b")
+            token_input = {clip_name: weighted_pairs}
+        else:
+            token_input = weighted_pairs
 
         # Perform CLIP encoding
-        cond_dict = clip.encode_from_tokens(token_dict, return_dict=True)
-        cond = cond_dict.pop("cond")
+        encoded = clip.encode_from_tokens(token_input, return_dict=True)
+        if isinstance(encoded, dict):
+            cond_dict = encoded.copy()
+            cond = cond_dict.pop("cond")
+        else:
+            cond = encoded
+            cond_dict = {}
 
         # Align mask length with encoded conditioning sequence length
         seq_len = cond.shape[1]
@@ -82,10 +101,7 @@ class MOSSTextEncode:
         elif mask.shape[0] > seq_len:
             mask = mask[:seq_len]
 
-        device = cond.device
-        dtype = cond.dtype
-        mask_tensor = mask.unsqueeze(0).to(device=device, dtype=dtype)
-
+        mask_tensor = mask.unsqueeze(0).to(device=cond.device, dtype=cond.dtype)
         cond_dict["c_negpip_mask"] = mask_tensor
         cond_dict["moss_negpip_mask"] = mask_tensor
 
@@ -122,22 +138,31 @@ class MOSSConditioningWeights:
             "required": {
                 "conditioning": ("CONDITIONING",),
                 "clip": ("CLIP",),
-                "text": ("STRING", {
-                    "multiline": True,
-                    "dynamicPrompts": True,
-                    "default": "",
-                    "tooltip": "Prompt string to parse attention weights from."
-                }),
-                "weight_multiplier": ("FLOAT", {
-                    "default": 5.0,
-                    "min": 1.0,
-                    "max": 50.0,
-                    "step": 0.5,
-                    "display": "number",
-                }),
-                "emphasis_mode": (["Original", "Ignore"], {
-                    "default": "Original",
-                }),
+                "text": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "dynamicPrompts": True,
+                        "default": "",
+                        "tooltip": "Prompt string to parse attention weights from.",
+                    },
+                ),
+                "weight_multiplier": (
+                    "FLOAT",
+                    {
+                        "default": 5.0,
+                        "min": 1.0,
+                        "max": 50.0,
+                        "step": 0.5,
+                        "display": "number",
+                    },
+                ),
+                "emphasis_mode": (
+                    ["Original", "Ignore"],
+                    {
+                        "default": "Original",
+                    },
+                ),
             }
         }
 
@@ -148,7 +173,8 @@ class MOSSConditioningWeights:
 
     def apply_weights(self, conditioning, clip, text, weight_multiplier=5.0, emphasis_mode="Original"):
         hf_tokenizer = get_hf_tokenizer(clip)
-        tokens, multipliers = tokenize_moss_prompt(hf_tokenizer, text, emphasis_mode)
+        template = get_chat_template(clip)
+        tokens, multipliers = tokenize_moss_prompt(hf_tokenizer, text, emphasis_mode, template=template)
         _, mask = compute_weight_masks(multipliers, weight_multiplier)
 
         out_cond = []
